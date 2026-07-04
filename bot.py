@@ -35,7 +35,8 @@ CHAT_ID = int(os.environ["CHAT_ID"])             # group/channel id (e.g. -100xx
 DM_MESSAGE = os.environ.get(
     "DM_MESSAGE",
     "Hi {name}! 👋\nThanks for requesting to join. Aapki request note kar li gayi hai."
-)
+).replace("\\n", "\n")
+DM_IMAGE_URL = os.environ.get("DM_IMAGE_URL", "")  # optional - image URL ya local file path
 AUTO_APPROVE = os.environ.get("AUTO_APPROVE", "false").lower() == "true"
 DELAY_BETWEEN_DMS = float(os.environ.get("DELAY_BETWEEN_DMS", "2"))  # seconds, spam-safety ke liye
 
@@ -109,8 +110,12 @@ async def mark_dmed(user_id: int):
 # ---------------- CORE LOGIC ----------------
 async def send_dm(user_id: int, name: str):
     """Send DM safely, handling flood wait + blocked users."""
+    text = DM_MESSAGE.format(name=name)
     try:
-        await app.send_message(user_id, DM_MESSAGE.format(name=name))
+        if DM_IMAGE_URL:
+            await app.send_photo(user_id, photo=DM_IMAGE_URL, caption=text)
+        else:
+            await app.send_message(user_id, text)
         await mark_dmed(user_id)
         log.info(f"DM sent to {user_id} ({name})")
     except FloodWait as e:
@@ -164,6 +169,17 @@ async def on_new_join_request(client: Client, request: ChatJoinRequest):
     name = user.first_name or "there"
     log.info(f"New join request from {user.id} ({name})")
     await handle_request(user.id, name, AUTO_APPROVE)
+
+
+# ---------------- ADMIN COMMAND: MANUAL SYNC ----------------
+@app.on_message(filters.private & filters.user(ADMIN_ID) & filters.command("sync"))
+async def sync_command(client: Client, message):
+    await message.reply_text("🔄 Syncing pending join requests...")
+    try:
+        await process_pending_requests()
+        await message.reply_text("✅ Sync done. Check logs/DMs for results.")
+    except Exception as e:
+        await message.reply_text(f"❌ Sync failed: {e}")
 
 
 # ---------------- MESSAGE RELAY: USER -> ADMIN ----------------
