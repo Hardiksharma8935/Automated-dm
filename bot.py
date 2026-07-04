@@ -39,6 +39,8 @@ DM_MESSAGE = os.environ.get(
 AUTO_APPROVE = os.environ.get("AUTO_APPROVE", "false").lower() == "true"
 DELAY_BETWEEN_DMS = float(os.environ.get("DELAY_BETWEEN_DMS", "2"))  # seconds, spam-safety ke liye
 
+ADMIN_ID = int(os.environ["ADMIN_ID"])  # tumhara Telegram user ID - yahan messages forward honge
+
 DB_PATH = "dmed_users.db"
 
 if not BOT_TOKEN and not SESSION_STRING:
@@ -61,7 +63,31 @@ async def init_db():
                 dmed_at TEXT
             )"""
         )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS relay_map (
+                forwarded_msg_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                user_name TEXT
+            )"""
+        )
         await db.commit()
+
+
+async def save_relay(forwarded_msg_id: int, user_id: int, user_name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO relay_map (forwarded_msg_id, user_id, user_name) VALUES (?, ?, ?)",
+            (forwarded_msg_id, user_id, user_name),
+        )
+        await db.commit()
+
+
+async def get_relay_user(forwarded_msg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id, user_name FROM relay_map WHERE forwarded_msg_id = ?", (forwarded_msg_id,)
+        )
+        return await cur.fetchone()
 
 
 async def already_dmed(user_id: int) -> bool:
@@ -115,6 +141,12 @@ async def process_pending_requests():
     log.info("Fetching existing pending join requests...")
     count = 0
     try:
+        # Peer resolve karna zaroori hai warna "Peer id invalid" error aata hai
+        await app.get_chat(CHAT_ID)
+    except Exception as e:
+        log.error(f"Could not resolve CHAT_ID {CHAT_ID}: {e}")
+        return
+    try:
         async for req in app.get_chat_join_requests(CHAT_ID):
             user = req.user
             name = user.first_name or "there"
@@ -132,6 +164,42 @@ async def on_new_join_request(client: Client, request: ChatJoinRequest):
     name = user.first_name or "there"
     log.info(f"New join request from {user.id} ({name})")
     await handle_request(user.id, name, AUTO_APPROVE)
+
+
+# ---------------- MESSAGE RELAY: USER -> ADMIN ----------------
+@app.on_message(filters.private & filters.incoming & ~filters.user(ADMIN_ID) & ~filters.bot)
+async def relay_user_to_admin(client: Client, message):
+    user = message.from_user
+    name = user.first_name or "Someone"
+    username = f"@{user.username}" if user.username else "no username"
+
+    header = f"📩 New message from {name} ({username}, id: {user.id})"
+    try:
+        await client.send_message(ADMIN_ID, header)
+        forwarded = await message.forward(ADMIN_ID)
+        await save_relay(forwarded.id, user.id, name)
+        log.info(f"Relayed message from {user.id} to admin")
+    except Exception as e:
+        log.error(f"Failed to relay message from {user.id}: {e}")
+
+
+# ---------------- MESSAGE RELAY: ADMIN REPLY -> USER ----------------
+@app.on_message(filters.private & filters.user(ADMIN_ID) & filters.reply)
+async def relay_admin_reply(client: Client, message):
+    replied = message.reply_to_message
+    if not replied:
+        return
+    row = await get_relay_user(replied.id)
+    if not row:
+        return  # ye reply kisi relay message ka nahi hai, ignore
+    user_id, user_name = row
+    try:
+        await message.copy(user_id)
+        await message.reply_text(f"✅ Sent to {user_name}")
+        log.info(f"Admin reply relayed to {user_id}")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to send: {e}")
+        log.error(f"Failed to relay admin reply to {user_id}: {e}")
 
 
 # ---------------- MAIN ----------------
